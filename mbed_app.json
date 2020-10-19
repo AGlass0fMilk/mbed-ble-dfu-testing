@@ -1,0 +1,9 @@
+{
+    "target_overrides": {
+        "*": {
+            "mbed-trace.enable": true,
+            "mbed-trace.max-level": "TRACE_LEVEL_DEBUG",
+            "platform.heap-stats-enabled": true
+        }
+    }
+}
