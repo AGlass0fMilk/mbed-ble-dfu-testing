@@ -57,6 +57,8 @@ public:
         /* Setup event handlers */
         gap_eh_chain.addEventHandler(this);
         gatt_srv_eh_chain.addEventHandler(this);
+        gap_eh_chain.addEventHandler(&uart_svc);
+        gatt_srv_eh_chain.addEventHandler(&uart_svc);
         _gap.setEventHandler(&gap_eh_chain);
         _gatt_srv.setEventHandler(&gatt_srv_eh_chain);
 
@@ -73,6 +75,14 @@ public:
         // We should never reach this
         TEST_ASSERT(1);
 
+    }
+
+    void on_ready(mbed::Callback<void(void)> ready_cb) {
+        _ready_cb = ready_cb;
+    }
+
+    const char* get_mac_addr_and_type(void) {
+        return _ble_mac_addr_and_type;
     }
 
 private:
@@ -110,10 +120,33 @@ private:
 
         TEST_ASSERT_EQUAL(BLE_ERROR_NONE, error);
 
+        // Populate the BLE MAC address string
+        sprint_mac_address_and_type(_ble_mac_addr_and_type);
+
+        if(_ready_cb) {
+            _ready_cb();
+        }
+
     }
 
     void schedule_ble_events(BLE::OnEventsToProcessCallbackContext *event) {
         _event_queue.call(mbed::callback(&event->ble, &BLE::processEvents));
+    }
+
+    /**
+     * Prints our own BLE MAC Address into given dest buffer
+     * @param[in] dest Destination buffer. Must hold at least 18 bytes
+     */
+    inline void sprint_mac_address_and_type(char* dest) {
+
+        /* Print out device MAC address to the destination buffer */
+        ble::own_address_type_t addr_type;
+        ble::address_t addr;
+        BLE::Instance().gap().getAddress(addr_type, addr);
+        snprintf(dest, 32, "%02x:%02x:%02x:%02x:%02x:%02x,%u",
+                addr[5], addr[4], addr[3], addr[2], addr[1], addr[0],
+                addr_type.value());
+
     }
 
 public:
@@ -134,6 +167,11 @@ private:
 
     ble::AdvertisingDataBuilder _adv_data_builder;
     ble::advertising_handle_t _adv_handle;
+
+    // Callback to be executed when BLE system is ready for test
+    mbed::Callback<void(void)> _ready_cb = nullptr;
+
+    char _ble_mac_addr_and_type[32];
 
 };
 
