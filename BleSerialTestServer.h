@@ -91,6 +91,16 @@ private:
 
         TEST_ASSERT_EQUAL(BLE_ERROR_NONE, event->error);
 
+        /* setup the default phy used in connection to 2M to increase maximum bit rate */
+        if (_gap.isFeatureSupported(ble::controller_supported_features_t::LE_2M_PHY)) {
+            ble::phy_set_t phys(/* 1M */ false, /* 2M */ true, /* coded */ false);
+
+            ble_error_t error = _gap.setPreferredPhys(/* tx */&phys, /* rx */&phys);
+            if (error) {
+                TEST_ASSERT_EQUAL(BLE_ERROR_NONE, error);
+            }
+        }
+
         uart_svc.start(_ble_interface);
 
         _event_queue.call(this, &BleSerialTestServer::start_advertising);

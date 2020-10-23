@@ -8,6 +8,7 @@
 #include "rtos/Thread.h"
 #include "rtos/ThisThread.h"
 #include "rtos/EventFlags.h"
+#include "rtos/Mail.h"
 
 #include "platform/SharedPtr.h"
 
@@ -31,12 +32,69 @@ using namespace std::chrono;
 using namespace utest::v1;
 
 static rtos::EventFlags flags;
+static rtos::Mail<ble::connection_handle_t, MBED_CONF_BLE_UART_SERVICE_MAX_SERIALS> connection_mbox;
 static BleSerialTestServer test_srv;
 static rtos::Thread ble_thread(osPriorityNormal,
         MBED_CONF_RTOS_THREAD_STACK_SIZE,
         NULL, "ble-thread");
 
-static ble::connection_handle_t c_handle = 0;
+class EchoThread : public rtos::Thread
+{
+public:
+
+    EchoThread() {
+    }
+
+    void execute(mbed::SharedPtr<UARTService::BleSerial> ser, bool blocking) {
+        _ser = ser;
+        if(blocking) {
+            start(mbed::callback(this, &EchoThread::blocking_echo));
+        } else {
+            start(mbed::callback(this, &EchoThread::nonblocking_echo));
+        }
+    }
+
+protected:
+
+    void blocking_echo(void) {
+        uint16_t mtu = _ser->get_mtu();
+
+        uint8_t* buf = new uint8_t[mtu];
+
+        TEST_ASSERT(buf != nullptr);
+
+        // Echo loop
+        while(!_ser->is_shutdown()) {
+            ssize_t result = _ser->read(buf, mtu);
+            // Serial shutdown during read or other error
+            if(result < 0) {
+                break;
+            }
+
+    #if READ_WRITE_DELAY
+            // Small delay between read/write
+            rtos::ThisThread::sleep_for(READ_WRITE_DELAY);
+    #endif
+
+            result = _ser->write(buf, result);
+            // Serial shutdown during write or other error
+            if(result < 0) {
+                break;
+            }
+        }
+
+        delete[] buf;
+    }
+
+    void nonblocking_echo(void) {
+        // TODO
+    }
+
+protected:
+
+    mbed::SharedPtr<UARTService::BleSerial> _ser;
+
+};
 
 static control_t echo_single_connection_blocking(const size_t call_count)
 {
@@ -46,35 +104,62 @@ static control_t echo_single_connection_blocking(const size_t call_count)
             test_srv.get_mac_addr_and_type());
 
     // Wait until we get a connection
-    TEST_ASSERT_NO_TIMEOUT(flags.wait_all_for(EVENT_FLAGS_BLE_CONNECTED, DEFAULT_TIMEOUT));
+    ble::connection_handle_t* c_handle = connection_mbox.try_get_for(DEFAULT_TIMEOUT);
+    TEST_ASSERT(c_handle != nullptr);
 
     // We are connected, get the BleSerial connection
-    mbed::SharedPtr<UARTService::BleSerial> ser = test_srv.uart_svc.get_ble_serial_handle(c_handle);
+    mbed::SharedPtr<UARTService::BleSerial> ser = test_srv.uart_svc.get_ble_serial_handle(*c_handle);
+    connection_mbox.free(c_handle);
 
-    uint16_t mtu = ser->get_mtu();
+    EchoThread echo;
+    echo.execute(ser, true);
+    echo.join();
 
-    uint8_t* buf = new uint8_t[mtu];
+    return CaseNext;
+}
 
-    TEST_ASSERT(buf != nullptr);
+static control_t echo_multi_connection_blocking(const size_t call_count)
+{
+    // Send callback and parameter to the host runner
+    greentea_send_kv("echo_multi_connection_blocking",
+            test_srv.get_mac_addr_and_type());
 
-    // Echo loop
-    while(!ser->is_shutdown()) {
-        ssize_t result = ser->read(buf, mtu);
-        // Serial shutdown during read
-        if(result == -ESHUTDOWN) {
-            ser = nullptr;
-            break;
+    int num_connections = 0;
+    EchoThread* threads[MBED_CONF_BLE_UART_SERVICE_MAX_SERIALS];
+
+    while(true) {
+        // Wait until we get a connection
+        ble::connection_handle_t* c_handle = connection_mbox.try_get_for(1s);
+
+        if(c_handle) {
+            // We got a new connection, get the BleSerial connection
+            mbed::SharedPtr<UARTService::BleSerial> ser = test_srv.uart_svc.get_ble_serial_handle(*c_handle);
+            connection_mbox.free(c_handle);
+
+            // Spin off EchoThread
+            EchoThread* echo = new EchoThread();
+            threads[num_connections++] = echo;
+            echo->execute(ser, true);
         }
 
-#if READ_WRITE_DELAY
-        // Small delay between read/write
-        rtos::ThisThread::sleep_for(READ_WRITE_DELAY);
-#endif
+        bool exit = true;
 
-        result = ser->write(buf, result);
-        // Serial shutdown during write
-        if(result == -ESHUTDOWN) {
-            ser = nullptr;
+        // Check if all started threads have terminated
+        // TODO - check errors? how many threads should we expect?
+        for(int i = 0; i < MBED_CONF_BLE_UART_SERVICE_MAX_SERIALS; i++) {
+            if(threads[i]) {
+                if(threads[i]->get_state() != rtos::Thread::Deleted) {
+                    exit = false;
+                    break;
+                }
+            }
+        }
+
+        if(exit) {
+            // Delete all EchoThreads
+            for(int i = 0; i < MBED_CONF_BLE_UART_SERVICE_MAX_SERIALS; i++) {
+                delete threads[i];
+            }
             break;
         }
     }
@@ -91,7 +176,7 @@ utest::v1::status_t greentea_setup(const size_t number_of_cases)
 
 Case cases[] = {
     Case("Echo single connection blocking", echo_single_connection_blocking),
-//    Case("Echo multi connection blocking", echo_multi_connection),
+    Case("Echo multi connection blocking", echo_multi_connection_blocking),
 //    Case("Echo single connection non-blocking", echo_non_blocking),
 //    Case("Echo multi connection non-blocking", echo_non_blocking),
 //    Case("Disconnect while reading", dc_while_reading),
@@ -110,9 +195,11 @@ public:
     virtual ~TestGapEventHandler() { }
 
     void onConnectionComplete(const ConnectionCompleteEvent &event) override {
-        // TODO add to list of multiple connection handles
-        c_handle = event.getConnectionHandle();
-        flags.set(EVENT_FLAGS_BLE_CONNECTED);
+        ble::connection_handle_t *c_slot = connection_mbox.try_alloc_for(rtos::Kernel::Clock::duration_u32::zero());
+        if(c_slot) {
+            *c_slot = event.getConnectionHandle();
+            connection_mbox.put(c_slot);
+        }
     }
 
     void onDisconnectionComplete(const DisconnectionCompleteEvent &event) override {
