@@ -103,11 +103,20 @@ private:
 
         uart_svc.start(_ble_interface);
 
-        _event_queue.call(this, &BleSerialTestServer::start_advertising);
+        _event_queue.call(this, &BleSerialTestServer::configure_and_start_advertising);
 
     }
 
     void start_advertising() {
+        ble_error_t error = _gap.startAdvertising(_adv_handle);
+
+        // Already initialized is also acceptable
+        if((error != BLE_ERROR_NONE) && (error != BLE_ERROR_ALREADY_INITIALIZED)) {
+            TEST_ASSERT(error);
+        }
+    }
+
+    void configure_and_start_advertising() {
 
         ble_error_t error;
 
@@ -126,9 +135,8 @@ private:
 
         TEST_ASSERT_EQUAL(BLE_ERROR_NONE, error);
 
-        error = _gap.startAdvertising(_adv_handle);
-
-        TEST_ASSERT_EQUAL(BLE_ERROR_NONE, error);
+        // Kick off advertising
+        start_advertising();
 
         // Populate the BLE MAC address string
         sprint_mac_address_and_type(_ble_mac_addr_and_type);
@@ -157,6 +165,15 @@ private:
                 addr[5], addr[4], addr[3], addr[2], addr[1], addr[0],
                 addr_type.value());
 
+    }
+
+protected:
+
+    /**
+     * ABA -- Always Be Advertising
+     */
+    void onAdvertisingEnd(const AdvertisingEndEvent &event) override {
+        _event_queue.call(this, &BleSerialTestServer::start_advertising);
     }
 
 public:

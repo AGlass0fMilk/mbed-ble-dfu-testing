@@ -42,7 +42,8 @@ class EchoThread : public rtos::Thread
 {
 public:
 
-    EchoThread() {
+    EchoThread(const char *name = nullptr):
+        rtos::Thread(osPriorityNormal, (OS_STACK_SIZE>>1), nullptr, name) {
     }
 
     void execute(mbed::SharedPtr<UARTService::BleSerial> ser, bool blocking) {
@@ -144,23 +145,26 @@ static control_t echo_multi_connection_blocking(const size_t call_count)
 
         bool exit = true;
 
-        // Check if all started threads have terminated
-        // TODO - check errors? how many threads should we expect?
-        for(int i = 0; i < MBED_CONF_BLE_UART_SERVICE_MAX_SERIALS; i++) {
-            if(threads[i]) {
-                if(threads[i]->get_state() != rtos::Thread::Deleted) {
-                    exit = false;
-                    break;
+        /** Must have at least 2 connections before checking to terminate this test */
+        if(num_connections >= 2) {
+            // Check if all started threads have terminated
+            // TODO - check errors? how many threads should we expect?
+            for(int i = 0; i < MBED_CONF_BLE_UART_SERVICE_MAX_SERIALS; i++) {
+                if(threads[i]) {
+                    if(threads[i]->get_state() != rtos::Thread::Deleted) {
+                        exit = false;
+                        break;
+                    }
                 }
             }
-        }
 
-        if(exit) {
-            // Delete all EchoThreads
-            for(int i = 0; i < MBED_CONF_BLE_UART_SERVICE_MAX_SERIALS; i++) {
-                delete threads[i];
+            if(exit) {
+                // Delete all EchoThreads
+                for(int i = 0; i < MBED_CONF_BLE_UART_SERVICE_MAX_SERIALS; i++) {
+                    delete threads[i];
+                }
+                break;
             }
-            break;
         }
     }
 
@@ -196,10 +200,9 @@ public:
 
     void onConnectionComplete(const ConnectionCompleteEvent &event) override {
         ble::connection_handle_t *c_slot = connection_mbox.try_alloc_for(rtos::Kernel::Clock::duration_u32::zero());
-        if(c_slot) {
-            *c_slot = event.getConnectionHandle();
-            connection_mbox.put(c_slot);
-        }
+        TEST_ASSERT(c_slot);
+        *c_slot = event.getConnectionHandle();
+        connection_mbox.put(c_slot);
     }
 
     void onDisconnectionComplete(const DisconnectionCompleteEvent &event) override {
