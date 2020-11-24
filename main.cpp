@@ -3,8 +3,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#if !MBED_TEST_MODE
-
 #include "rtos/Thread.h"
 #include "rtos/ThisThread.h"
 #include "rtos/EventFlags.h"
@@ -12,12 +10,17 @@
 
 #include "platform/SharedPtr.h"
 
+#include "drivers/BufferedSerial.h"
+#include "drivers/DigitalOut.h"
+
+#include "mbed_trace.h"
+
 #include "BleSerialTestServer.h"
 
-#include "greentea-client/test_env.h"
-#include "unity/unity.h"
-
 #include <chrono>
+
+#define RX_BUFFER_XOFF_THRESHOLD 128
+#define RX_BUFFER_XON_THRESHOLD 196
 
 #define DEFAULT_TIMEOUT 30s
 #define READ_WRITE_DELAY 0
@@ -29,166 +32,16 @@
 #define EVENT_FLAGS_BLE_DISCONNECTED    0x0004
 
 using namespace std::chrono;
-using namespace utest::v1;
 
+//static mbed::BufferedSerial pc(STDIO_UART_TX, STDIO_UART_RX, 115200);
+static events::EventQueue main_queue;
 static rtos::EventFlags flags;
-static rtos::Mail<ble::connection_handle_t, MBED_CONF_BLE_UART_SERVICE_MAX_SERIALS> connection_mbox;
-static BleSerialTestServer test_srv;
+static BleSerialTestServer test_srv(main_queue);
 static rtos::Thread ble_thread(osPriorityNormal,
-        MBED_CONF_RTOS_THREAD_STACK_SIZE,
+        MBED_CONF_RTOS_THREAD_STACK_SIZE << 2,
         NULL, "ble-thread");
 
-class EchoThread : public rtos::Thread
-{
-public:
-
-    EchoThread(const char *name = nullptr):
-        rtos::Thread(osPriorityNormal, (OS_STACK_SIZE>>1), nullptr, name) {
-    }
-
-    void execute(mbed::SharedPtr<UARTService::BleSerial> ser, bool blocking) {
-        _ser = ser;
-        if(blocking) {
-            start(mbed::callback(this, &EchoThread::blocking_echo));
-        } else {
-            start(mbed::callback(this, &EchoThread::nonblocking_echo));
-        }
-    }
-
-protected:
-
-    void blocking_echo(void) {
-        uint16_t mtu = _ser->get_mtu();
-
-        uint8_t* buf = new uint8_t[mtu];
-
-        TEST_ASSERT(buf != nullptr);
-
-        // Echo loop
-        while(!_ser->is_shutdown()) {
-            ssize_t result = _ser->read(buf, mtu);
-            // Serial shutdown during read or other error
-            if(result < 0) {
-                break;
-            }
-
-    #if READ_WRITE_DELAY
-            // Small delay between read/write
-            rtos::ThisThread::sleep_for(READ_WRITE_DELAY);
-    #endif
-
-            result = _ser->write(buf, result);
-            // Serial shutdown during write or other error
-            if(result < 0) {
-                break;
-            }
-        }
-
-        delete[] buf;
-    }
-
-    void nonblocking_echo(void) {
-        // TODO
-    }
-
-protected:
-
-    mbed::SharedPtr<UARTService::BleSerial> _ser;
-
-};
-
-static control_t echo_single_connection_blocking(const size_t call_count)
-{
-
-    // Send callback and parameter to the host runner
-    greentea_send_kv("echo_single_connection_blocking",
-            test_srv.get_mac_addr_and_type());
-
-    // Wait until we get a connection
-    ble::connection_handle_t* c_handle = connection_mbox.try_get_for(DEFAULT_TIMEOUT);
-    TEST_ASSERT(c_handle != nullptr);
-
-    // We are connected, get the BleSerial connection
-    mbed::SharedPtr<UARTService::BleSerial> ser = test_srv.uart_svc.get_ble_serial_handle(*c_handle);
-    connection_mbox.free(c_handle);
-
-    EchoThread echo;
-    echo.execute(ser, true);
-    echo.join();
-
-    return CaseNext;
-}
-
-static control_t echo_multi_connection_blocking(const size_t call_count)
-{
-    // Send callback and parameter to the host runner
-    greentea_send_kv("echo_multi_connection_blocking",
-            test_srv.get_mac_addr_and_type());
-
-    int num_connections = 0;
-    EchoThread* threads[MBED_CONF_BLE_UART_SERVICE_MAX_SERIALS];
-
-    while(true) {
-        // Wait until we get a connection
-        ble::connection_handle_t* c_handle = connection_mbox.try_get_for(1s);
-
-        if(c_handle) {
-            // We got a new connection, get the BleSerial connection
-            mbed::SharedPtr<UARTService::BleSerial> ser = test_srv.uart_svc.get_ble_serial_handle(*c_handle);
-            connection_mbox.free(c_handle);
-
-            // Spin off EchoThread
-            EchoThread* echo = new EchoThread();
-            threads[num_connections++] = echo;
-            echo->execute(ser, true);
-        }
-
-        bool exit = true;
-
-        /** Must have at least 2 connections before checking to terminate this test */
-        if(num_connections >= 2) {
-            // Check if all started threads have terminated
-            // TODO - check errors? how many threads should we expect?
-            for(int i = 0; i < MBED_CONF_BLE_UART_SERVICE_MAX_SERIALS; i++) {
-                if(threads[i]) {
-                    if(threads[i]->get_state() != rtos::Thread::Deleted) {
-                        exit = false;
-                        break;
-                    }
-                }
-            }
-
-            if(exit) {
-                // Delete all EchoThreads
-                for(int i = 0; i < MBED_CONF_BLE_UART_SERVICE_MAX_SERIALS; i++) {
-                    delete threads[i];
-                }
-                break;
-            }
-        }
-    }
-
-    return CaseNext;
-}
-
-utest::v1::status_t greentea_setup(const size_t number_of_cases)
-{
-    GREENTEA_SETUP(60, "ble_serial_test");
-
-    return greentea_test_setup_handler(number_of_cases);
-}
-
-Case cases[] = {
-    Case("Echo single connection blocking", echo_single_connection_blocking),
-    Case("Echo multi connection blocking", echo_multi_connection_blocking),
-//    Case("Echo single connection non-blocking", echo_non_blocking),
-//    Case("Echo multi connection non-blocking", echo_non_blocking),
-//    Case("Disconnect while reading", dc_while_reading),
-//    Case("Disconnect while writing", dc_while_writing),
-//    Case("Memory leak", memory_leak)
-};
-
-Specification specification(greentea_setup, cases);
+static mbed::DigitalOut led2(LED2, 1);
 
 class TestGapEventHandler : public ble::Gap::EventHandler {
 
@@ -199,14 +52,23 @@ public:
     virtual ~TestGapEventHandler() { }
 
     void onConnectionComplete(const ConnectionCompleteEvent &event) override {
-        ble::connection_handle_t *c_slot = connection_mbox.try_alloc_for(rtos::Kernel::Clock::duration_u32::zero());
-        TEST_ASSERT(c_slot);
-        *c_slot = event.getConnectionHandle();
-        connection_mbox.put(c_slot);
+        printf("connected\r\n");
     }
 
     void onDisconnectionComplete(const DisconnectionCompleteEvent &event) override {
+        printf("disconnected\r\n");
         flags.set(EVENT_FLAGS_BLE_DISCONNECTED);
+    }
+
+
+    void onPhyUpdateComplete(ble_error_t status, connection_handle_t connectionHandle,
+            phy_t txPhy, phy_t rxPhy) {
+        if(status == BLE_ERROR_NONE) {
+            printf("phy update complete:\r\n");
+            printf("\ttxPhy: %d, rxPhy: %d\r\n", txPhy.value(), rxPhy.value());
+        } else {
+            printf("phy update error: %d\r\n", status);
+        }
     }
 };
 
@@ -224,19 +86,33 @@ static void on_ble_ready(void) {
     flags.set(EVENT_FLAGS_BLE_READY);
 }
 
+PlatformMutex trace_mtx;
+void trace_mtx_get(void) {
+    trace_mtx.lock();
+}
+
+void trace_mtx_release(void) {
+    trace_mtx.unlock();
+}
+
 int main()
 {
+    mbed_trace_init();
+    mbed_trace_mutex_wait_function_set(trace_mtx_get);
+    mbed_trace_mutex_release_function_set(trace_mtx_release);
+
+    mbed_trace_include_filters_set("btdfu");
+
     // Setup BleSerialTestServer
     test_srv.on_ready(on_ble_ready);
 
     // Spin off BLE thread
     ble_thread.start(ble_thread_main);
 
-    // Wait for BLE system to be ready
-    TEST_ASSERT_NO_TIMEOUT(flags.wait_all_for(EVENT_FLAGS_BLE_READY, DEFAULT_TIMEOUT));
+    flags.wait_all_for(EVENT_FLAGS_BLE_READY, DEFAULT_TIMEOUT);
 
-    return !Harness::run(specification);
+    main_queue.dispatch_forever();
+
+    return 0;
 }
 
-
-#endif
